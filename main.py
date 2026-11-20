@@ -8,10 +8,12 @@ The model works on earned counts rather than on the printed rate alone:
     k_i(t) = rate_i(t) / 100 * players_tracked(t)
 
 so that a refresh which only adds unearned players is a change in the
-denominator and not mistaken for players losing trophies.  k and the tracked
-count are extrapolated from the case's own history with a power law in hours
-since release, and the forecast rate is their ratio.  The quantile spread
-combines the fit residual, the horizon and the counting noise of k.
+denominator, not players losing trophies.  k and the tracked count are
+extrapolated from the case's own history with a power law in hours since
+release, and the forecast rate is their ratio: a tracked count that outgrows a
+trophy's earners dilutes it, while a trophy on the early story line gains.  The
+quantile spread combines the fit residual, the horizon and the counting noise
+of k, so a trophy earned by a handful of players is forecast wide.
 """
 
 import datetime
@@ -23,14 +25,14 @@ from pathlib import Path
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 Z = [-1.6449, -0.6745, 0.0, 0.6745, 1.6449]
 
-# How far back from the last read the growth is fitted, in hours.  The final
-# history is about two and a half days long; a day of reads carries the shape
-# of the growth without drowning in the launch-night step.
+# Growth is fitted on the reads of the last two days: the final history is
+# about two and a half days long, so this keeps the launch-night step from
+# setting the slope while still seeing the tracked count move.
 FIT_HOURS = 48.0
 # Shrinkage of a trophy's own exponent towards the pooled one.
 SHRINK = 6.0
-# Prior exponent of k - log(N) when a trophy has too few usable reads: rates
-# on a launch week drift up, slowly.
+# Prior exponent of the rate when a trophy has too few usable reads.  Rates on
+# a launch week drift up, slowly.
 PRIOR_BETA = 0.6
 
 
@@ -48,7 +50,7 @@ def expit(x):
 
 
 def hours_since_release(at, release):
-    # at: ISO 8601 UTC; release: YYYY-MM-DD.  Both are read as UTC.
+    """Hours from the game's release date to an ISO 8601 UTC instant."""
     day = datetime.date(int(at[0:4]), int(at[5:7]), int(at[8:10]))
     rel = datetime.date(int(release[0:4]), int(release[5:7]), int(release[8:10]))
     days = (day - rel).days
@@ -101,44 +103,37 @@ def forecast(case):
     if not rows:
         raise SystemExit("no usable history")
 
-    t_last, n_last, rates_last = rows[-1]
-    # The fit window: reads in the last FIT_HOURS before the last one, plus the
-    # first read so a short history still has a span.
+    t_last = rows[-1][0]
     window = [r for r in rows if r[0] >= t_last - FIT_HOURS]
     if len(window) < 4:
         window = rows
 
     lx = [math.log(max(r[0], 0.05)) for r in window]
     ln = [math.log(r[1]) for r in window]
-    na, nb, nn = fit_loglog(lx, ln)
+    _, nb, _ = fit_loglog(lx, ln)
     if nb is None:
         nb = 1.0
 
-    # Pooled exponent of k/N: each trophy's beta, weighted by its span.
+    # Pooled exponent of the rate: each trophy's own slope of log k minus the
+    # tracked count's, over trophies that carry enough earners to fit.
     betas = []
     for i in range(len(trophies)):
         ys = []
-        ok = True
         for r in window:
             rate = r[2][i] if i < len(r[2]) else None
-            if rate is None:
-                ok = False
+            if rate is None or rate / 100.0 * r[1] < 1.0:
+                ys = None
                 break
-            k = rate / 100.0 * r[1]
-            if k < 1.0:
-                ok = False
-                break
-            ys.append(math.log(k))
-        if not ok or len(ys) < 3:
+            ys.append(math.log(rate / 100.0 * r[1]))
+        if not ys or len(ys) < 3:
             continue
-        ka, kb, kn = fit_loglog(lx, ys)
+        _, kb, _ = fit_loglog(lx, ys)
         if kb is not None:
             betas.append(kb - nb)
     beta_pool = sorted(betas)[len(betas) // 2] if betas else PRIOR_BETA
 
     out = []
-    for i in range(len(trophies)):
-        # Last read that carries this trophy.
+    for i, trophy in enumerate(trophies):
         rate_last = None
         for r in reversed(rows):
             if i < len(r[2]) and r[2][i] is not None:
@@ -149,54 +144,43 @@ def forecast(case):
         if rate_last is None:
             out.append([0.01, 0.01, 0.01, 0.02, 0.05])
             continue
-
         if rate_last >= 99.995:
             out.append([100.0] * 5)
             continue
 
         k_last = max(rate_last / 100.0 * n_ref, 0.0)
 
-        # Trophy's own growth exponent of k, on the same window.
         ys = []
         for r in window:
-            if i < len(r[2]) and r[2][i] is not None:
-                k = r[2][i] / 100.0 * r[1]
-                if k >= 1.0:
-                    ys.append(math.log(k))
-                else:
-                    ys.append(None)
-            else:
-                ys.append(None)
+            rate = r[2][i] if i < len(r[2]) else None
+            k = rate / 100.0 * r[1] if rate is not None else 0.0
+            ys.append(math.log(k) if k >= 1.0 else None)
         ka, kb, kn = fit_loglog(lx, ys)
         if kb is None:
             beta = PRIOR_BETA
             resid_sd = 0.55
         else:
             beta = (kn * kb + SHRINK * beta_pool) / (kn + SHRINK)
-            # A shrinkage towards "the rate drifts up a little", not towards
-            # the pooled value alone.
-            beta = 0.6 * beta + 0.4 * PRIOR_BETA
+            beta = 0.6 * (beta - nb) + 0.4 * PRIOR_BETA
             rr = residuals(lx, ys, ka, kb)
-            resid_sd = math.sqrt(sum(v * v for v in rr) / max(len(rr) - 2, 1)) if len(rr) > 2 else 0.55
+            resid_sd = (
+                math.sqrt(sum(v * v for v in rr) / max(len(rr) - 2, 1))
+                if len(rr) > 2
+                else 0.55
+            )
         beta = max(-1.5, min(2.5, beta))
 
         dt = max(target_h - t_ref, 0.0)
         ratio = math.log(max(target_h, t_ref + 0.01) / max(t_ref, 0.05))
-
-        # median rate: k grows as t^beta on top of the tracked count's growth
-        # (which is already inside beta, so only beta moves the rate).
         x = logit(rate_last) + beta * ratio
         med = expit(x)
 
-        # Spread: fit residual, horizon, and the counting noise of k.
-        horizon_days = max(dt, 0.0) / 24.0
+        horizon_days = dt / 24.0
         sigma = math.sqrt(resid_sd ** 2 + (0.38 * math.sqrt(horizon_days)) ** 2)
         sigma += 1.0 / math.sqrt(max(k_last, 1.0))
-        sigma = max(0.18, min(2.0, sigma))
+        sigma = max(0.20, min(2.0, sigma))
 
-        q = []
-        for z in Z:
-            q.append(round(expit(x + z * sigma), 4))
+        q = [round(expit(x + z * sigma), 4) for z in Z]
         q = [min(max(v, 0.01), 100.0) for v in q]
         for j in range(1, 5):
             if q[j] < q[j - 1]:
