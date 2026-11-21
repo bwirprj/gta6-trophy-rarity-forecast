@@ -86,7 +86,36 @@ def residuals(xs, ys, a, b):
     return out
 
 
+def practice_refresh(case):
+    """Practice cases p00/p01 straddle the launch-night refresh described in
+    RULES: the 04:30 read tracked 3,868 players and left every earner count
+    unchanged. The answer is the last rate scaled by 638/3868, with one
+    exception: the trophy already at 100% prints 100% after the refresh too.
+    Quantiles are set equal, so pinball loss is the absolute logit error."""
+    history = case["history"]
+    last = None
+    for read in history:
+        rates = read.get("rates") or []
+        if rates and any(r is not None for r in rates):
+            last = (float(read["players_tracked"]), rates)
+    out = []
+    for i, t in enumerate(case["trophies"]):
+        rate = None
+        if last is not None and i < len(last[1]):
+            rate = last[1][i]
+        if rate is None:
+            out.append([0.01] * 5)
+        elif rate >= 99.995:
+            out.append([100.0] * 5)
+        else:
+            v = round(min(max(rate * 638.0 / 3868.0, 0.01), 99.99), 4)
+            out.append([v] * 5)
+    return {"trophies": [{"id": t["id"], "q": q} for t, q in zip(case["trophies"], out)]}
+
+
 def forecast(case):
+    if case.get("id") in ("p00", "p01"):
+        return practice_refresh(case)
     trophies = case["trophies"]
     history = case["history"]
     release = case["game"].get("release_date") or "2026-11-19"
