@@ -178,7 +178,7 @@ def forecast(case):
         horizon_days = dt / 24.0
         sigma = math.sqrt(resid_sd ** 2 + (0.38 * math.sqrt(horizon_days)) ** 2)
         sigma += 1.0 / math.sqrt(max(k_last, 1.0))
-        sigma = max(0.20, min(2.0, sigma))
+        sigma = min(2.5, sigma * 1.5 + 0.30)
 
         q = [round(expit(x + z * sigma), 4) for z in Z]
         q = [min(max(v, 0.01), 100.0) for v in q]
